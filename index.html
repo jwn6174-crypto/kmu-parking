@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KMU Parking Heatmap V3</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #f8f8f6; color: #222; padding: 2rem;
+  }
+  .card {
+    background: #fff; border-radius: 16px;
+    border: 0.5px solid rgba(0,0,0,0.12);
+    padding: 2rem; max-width: 1180px; margin: 0 auto; width: 100%;
+  }
+  h1 { font-size: 18px; font-weight: 500; margin-bottom: 4px; color: #111; }
+  .subtitle { font-size: 13px; color: #888; margin-bottom: 20px; }
+  .controls { display: flex; gap: 8px; margin-bottom: 14px; }
+  .controls button {
+    font-size: 13px; padding: 5px 16px; border-radius: 8px;
+    border: 0.5px solid rgba(0,0,0,0.2); background: transparent;
+    cursor: pointer; transition: background 0.15s; color: #333;
+  }
+  .controls button:hover { background: #f0f0ee; }
+  .controls button.on { background: #f0f0ee; font-weight: 500; }
+  .legend { display: flex; align-items: center; margin-bottom: 12px; max-width: 890px; }
+  .lb { height: 12px; flex: 1; }
+  .ll { font-size: 12px; color: #888; padding: 0 6px; }
+  canvas { display: block; max-width: 100%; }
+  #info { font-size: 13px; color: #888; margin-top: 10px; min-height: 20px; }
+  .grade-legend { display: flex; gap: 8px; margin-top: 16px; }
+  .grade-badge { font-size: 12px; padding: 3px 10px; border-radius: 5px; color: #fff; font-weight: 500; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>KMU Parking Heatmap V3</h1>
+  <p class="subtitle">연결구(엘리베이터·통로)까지의 거리 기반 등급 분류 — 격자 재설계판</p>
+  <div class="controls">
+    <button id="bE" class="on" onclick="_sm('E')">직선 거리</button>
+    <button id="bW" onclick="_sm('W')">보행 거리</button>
+    <button id="bM" onclick="_sm('M')">절충 거리</button>
+  </div>
+  <div id="mixRow" style="display:none;align-items:center;gap:10px;margin-bottom:14px;">
+    <span style="font-size:12px;color:#888;">보행 위주</span>
+    <input id="mixSlider" type="range" min="0" max="100" value="50"
+           style="flex:1;max-width:300px;" oninput="_mix(this.value)">
+    <span style="font-size:12px;color:#888;">직선 위주</span>
+    <span id="mixVal" style="font-size:12px;color:#555;min-width:74px;">절반 절충</span>
+  </div>
+  <div class="legend">
+    <span class="ll">접근성 좋음</span>
+    <div class="lb" style="background:#2563eb"></div>
+    <div class="lb" style="background:#93c5fd"></div>
+    <div class="lb" style="background:#fca5a5"></div>
+    <div class="lb" style="background:#dc2626"></div>
+    <span class="ll">접근성 나쁨</span>
+  </div>
+  <canvas id="pv"></canvas>
+  <div id="info"></div>
+  <div class="grade-legend">
+    <span class="grade-badge" style="background:#2563eb">A</span>
+    <span class="grade-badge" style="background:#93c5fd;color:#1e3a8a">B</span>
+    <span class="grade-badge" style="background:#fca5a5;color:#7f1d1d">C</span>
+    <span class="grade-badge" style="background:#dc2626">D</span>
+  </div>
+</div>
+<script>
+(function(){
+// ===== 격자 기반 설계 =====
+// 한 칸(cell) = 정사각형. 자리는 항상 2칸 차지.
+//   세로형 자리: 폭1칸 x 높이2칸  -> 그리드 (gx,gy)+(gx,gy+1)
+//   가로형 자리: 폭2칸 x 높이1칸  -> 그리드 (gx,gy)+(gx+1,gy)
+const U=15;            // 한 칸 픽셀 크기
+const GAPC=0.12;       // 자리 사이 간격(칸 비율)
+const GW=50, GH=20;    // 논리 격자 크기 (섬 몸통 칸 제거)
+const OX=70, OY=88;    // 그리기 원점 오프셋
+
+// 픽셀 변환
+const px=gx=>OX+gx*U;
+const py=gy=>OY+gy*U;
+
+// ===== BFS 논리 격자 =====
+const AISLE=0,SPOT=1,WALL=2;
+const g=Array.from({length:GH},()=>new Uint8Array(GW));
+const gfill=(x0,y0,x1,y1,v)=>{
+  for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++)
+    if(x>=0&&x<GW&&y>=0&&y<GH)g[y][x]=v;
+};
+// 외벽
+for(let y=0;y<GH;y++){g[y][0]=WALL;g[y][49]=WALL;}
+// 섬 몸통 WALL 띠는 없앰. 주차 자리(SPOT) 셀 자체가 BFS 통행 불가가 되어
+// 섬 덩어리가 자연스러운 장벽 역할을 한다.
+
+// ===== 자리 정의 =====
+// 각 자리: {cells:[[gx,gy],...], px,py,pw,ph, dirH, gx,gy(대표=첫 셀)}
+const spots=[];
+function addV(gx,gy){ // 세로형: (gx,gy)+(gx,gy+1)
+  const m=GAPC*U;
+  spots.push({
+    cells:[[gx,gy],[gx,gy+1]], gx,gy, dirH:false,
+    px:px(gx)+m, py:py(gy)+m, pw:U-2*m, ph:2*U-2*m,
+    cx:px(gx)+U/2, cy:py(gy)+U
+  });
+}
+function addH(gx,gy,pyOff){ // 가로형: (gx,gy)+(gx+1,gy)
+  // pyOff: 화면상 세로 미세 이동(칸 단위, 격자 좌표엔 영향 없음)
+  const m=GAPC*U, off=(pyOff||0)*U;
+  spots.push({
+    cells:[[gx,gy],[gx+1,gy]], gx,gy, dirH:true,
+    px:px(gx)+m, py:py(gy)+m+off, pw:2*U-2*m, ph:U-2*m,
+    cx:px(gx)+U, cy:py(gy)+U/2+off
+  });
+}
+
+// 상단 세로자리 42개: x=4~45, y=0~1
+for(let x=4;x<=45;x++) addV(x,0);
+// 상단 우측 끝 세로자리 2개 추가: x=46,47
+addV(46,0); addV(47,0);
+
+// 좌벽 가로자리 15개: x=1~2, y=2~16 (각 높이1) — 섬 세로 범위에 맞춤
+for(let i=0;i<15;i++) addH(1,2+i);
+
+// 섬 3열 — 몸통 칸 제거로 윗자리와 아랫자리가 맞붙음
+// 1열: 윗 y=3~4, 아래 y=5~6 / 2열: 윗 y=8~9, 아래 y=10~11 / 3열: 윗 y=13~14, 아래 y=15~16
+const ISL=[{ty:3,by:5},{ty:8,by:10},{ty:13,by:15}];
+ISL.forEach(({ty,by})=>{
+  // 좌섬 윗/아래 세로자리 20개씩 x=4~23
+  for(let x=4;x<=23;x++){ addV(x,ty); addV(x,by); }
+  // 우섬 윗/아래 세로자리 17개씩 x=29~45
+  for(let x=29;x<=45;x++){ addV(x,ty); addV(x,by); }
+  // 끝슬롯 가로자리 3개씩: 섬 세로면 4칸(ty~ty+3) 중앙에 0.5칸 내려 대칭 배치
+  for(let k=0;k<3;k++){
+    addH(24,ty+k,0.5);  // 끝슬롯L
+    addH(27,ty+k,0.5);  // 끝슬롯R
+  }
+});
+
+// 하단 세로자리 y=18~19
+for(let x=1;x<=3;x++)  addV(x,18);   // 하단 좌측 끝 3개 추가
+for(let x=4;x<=9;x++)  addV(x,18);   // 하단 좌 6개
+for(let x=11;x<=25;x++) addV(x,18);  // 하단 중 15개
+for(let x=27;x<=45;x++) addV(x,18);  // 하단 우 19개
+addV(46,18); addV(47,18);            // 하단 우측 끝 2개 추가
+
+// SPOT 마킹 (BFS용) — 자리가 점유한 모든 셀
+spots.forEach(s=>s.cells.forEach(([cx,cy])=>{ if(g[cy][cx]!==WALL) g[cy][cx]=SPOT; }));
+
+// 끝슬롯 보정: 끝슬롯은 화면상 3칸이지만 섬 세로면 4칸을 막아야 한다.
+// 비어 남은 4번째 칸(y=ty+3)을 WALL로 채워 BFS가 섬을 관통하지 못하게 한다.
+ISL.forEach(({ty})=>{
+  [24,25,27,28].forEach(x=>{ g[ty+3][x]=WALL; });
+});
+
+// ===== 연결구 5개 =====
+const cons=[
+  {gx:3, gy:0,  n:'좌 엘리베이터'},
+  {gx:48,gy:0,  n:'우 엘리베이터'},
+  {gx:10,gy:19, n:'복지관 통로 2'},
+  {gx:26,gy:19, n:'복지관 통로 1'},
+  {gx:48,gy:19, n:'미래관 통로'},
+];
+cons.forEach(c=>{ c.cx=px(c.gx)+U/2; c.cy=py(c.gy)+U/2; });
+
+// ===== BFS =====
+// 통로(AISLE) 셀로만 이동. 자리(SPOT)·벽(WALL)은 통행 불가 -> 섬이 장벽.
+function makeBFS(){
+  const d=Array.from({length:GH},()=>new Uint16Array(GW).fill(65535));
+  const q=[];
+  // 연결구 셀에서 시작 (연결구는 통로 위에 있음)
+  cons.forEach(c=>{ d[c.gy][c.gx]=0; q.push([c.gx,c.gy]); });
+  const D=[[-1,0],[1,0],[0,-1],[0,1]];
+  for(let h=0;h<q.length;h++){
+    const[cx,cy]=q[h],cd=d[cy][cx];
+    for(const[dx,dy]of D){
+      const nx=cx+dx,ny=cy+dy;
+      if(nx>=0&&nx<GW&&ny>=0&&ny<GH&&g[ny][nx]===AISLE&&d[ny][nx]===65535){
+        d[ny][nx]=cd+1; q.push([nx,ny]);
+      }
+    }
+  }
+  return d;
+}
+const BD=makeBFS();
+
+// ===== 거리 함수 =====
+const eucl=(cx,cy)=>Math.min(...cons.map(c=>Math.hypot(cx-c.cx,cy-c.cy)));
+// 보행거리: 자리 셀들에 인접한 통로 셀의 BFS 거리 + 1 (자리->통로 한 걸음)
+const D4=[[-1,0],[1,0],[0,-1],[0,1]];
+function bfsDist(s){
+  let best=65535;
+  s.cells.forEach(([cx,cy])=>{
+    for(const[dx,dy]of D4){
+      const nx=cx+dx,ny=cy+dy;
+      if(nx>=0&&nx<GW&&ny>=0&&ny<GH&&g[ny][nx]===AISLE){
+        const cand=BD[ny][nx]+1;
+        if(cand<best)best=cand;
+      }
+    }
+  });
+  return best;
+}
+
+const gc=t=>t<.25?'#2563eb':t<.5?'#93c5fd':t<.75?'#fca5a5':'#dc2626';
+const gL=t=>t<.25?'A':t<.5?'B':t<.75?'C':'D';
+
+// 각 자리의 직선·보행 원거리 계산
+spots.forEach(s=>{
+  s.dE=eucl(s.cx,s.cy);   // 직선 원거리
+  s.dW=bfsDist(s);        // 보행 원거리
+});
+// 각 거리를 0~1로 정규화 (서로 단위가 달라 따로 정규화)
+function normalize(key,outKey){
+  let a=Infinity,b=-Infinity;
+  spots.forEach(s=>{const v=s[key];if(v<a)a=v;if(v>b)b=v;});
+  const span=(b-a)||1;
+  spots.forEach(s=>{ s[outKey]=(s[key]-a)/span; });
+}
+normalize('dE','nE');   // 직선 정규값 0~1
+normalize('dW','nW');   // 보행 정규값 0~1
+
+let mode='E';           // 'E' 직선 / 'W' 보행 / 'M' 절충
+let alpha=0.5;          // 절충 비율: 1=순수직선, 0=순수보행
+
+// 자리의 "정규화된 거리값" t (0~1) — 등급·색에 바로 쓰임
+function tOf(s){
+  if(mode==='E') return s.nE;
+  if(mode==='W') return s.nW;
+  return alpha*s.nE + (1-alpha)*s.nW;   // 절충
+}
+// 표시용 원거리 (info 텍스트)
+function rawDist(s){
+  if(mode==='E') return s.dE;
+  if(mode==='W') return s.dW;
+  return alpha*s.dE + (1-alpha)*s.dW;
+}
+
+// ===== 캔버스 =====
+const cv=document.getElementById('pv');
+cv.width=GW*U+OX*2;
+cv.height=GH*U+OY+44;
+const ctx=cv.getContext('2d');
+
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  // 주차장 바닥
+  ctx.fillStyle='rgba(0,0,0,.03)';
+  ctx.fillRect(OX,OY,GW*U,GH*U);
+  // 섬 경계선 — 윗자리/아랫자리 사이에 칸 없이 얇은 선만
+  ctx.strokeStyle='rgba(0,0,0,.28)';
+  ctx.lineWidth=1.5;
+  [5,10,15].forEach(by=>{      // 각 섬 아랫자리 시작 y
+    const ly=py(by);
+    // 좌섬 x=4~23
+    ctx.beginPath();
+    ctx.moveTo(px(4),ly); ctx.lineTo(px(24),ly);
+    ctx.stroke();
+    // 우섬 x=29~45
+    ctx.beginPath();
+    ctx.moveTo(px(29),ly); ctx.lineTo(px(46),ly);
+    ctx.stroke();
+  });
+  // 자리
+  spots.forEach(s=>{
+    ctx.fillStyle=gc(tOf(s));
+    ctx.fillRect(s.px,s.py,s.pw,s.ph);
+  });
+  // 연결구
+  cons.forEach(c=>{
+    ctx.strokeStyle='#fff';ctx.lineWidth=3.5;
+    ctx.beginPath();ctx.arc(c.cx,c.cy,7,0,Math.PI*2);ctx.stroke();
+    ctx.strokeStyle='#333';ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(c.cx,c.cy,7,0,Math.PI*2);ctx.stroke();
+  });
+  // 라벨
+  ctx.font='12px -apple-system,sans-serif';ctx.fillStyle='#555';
+  // 엘리베이터: 주차장 영역 위쪽 여백에 배치 (자리에 안 가림)
+  ctx.textAlign='left';
+  ctx.fillText('좌 엘리베이터',cons[0].cx-7,OY-14);
+  ctx.textAlign='right';
+  ctx.fillText('우 엘리베이터',cons[1].cx+7,OY-14);
+  // 통로: 자리 아래쪽
+  ctx.textAlign='center';
+  ctx.fillText('복지관 2',cons[2].cx,cons[2].cy+22);
+  ctx.fillText('복지관 1',cons[3].cx,cons[3].cy+22);
+  ctx.fillText('미래관',cons[4].cx,cons[4].cy+22);
+}
+
+window._sm=m=>{
+  mode=m;
+  document.getElementById('bE').classList.toggle('on',m==='E');
+  document.getElementById('bW').classList.toggle('on',m==='W');
+  document.getElementById('bM').classList.toggle('on',m==='M');
+  // 절충 모드일 때만 슬라이더 표시
+  document.getElementById('mixRow').style.display=(m==='M')?'flex':'none';
+  draw();
+};
+
+window._mix=v=>{
+  alpha=v/100;   // 슬라이더 0~100 -> 0~1 (0=보행, 100=직선)
+  const lbl=document.getElementById('mixVal');
+  if(alpha>=0.8)      lbl.textContent='직선 위주';
+  else if(alpha>=0.6) lbl.textContent='직선 쪽';
+  else if(alpha>0.4)  lbl.textContent='절반 절충';
+  else if(alpha>0.2)  lbl.textContent='보행 쪽';
+  else                lbl.textContent='보행 위주';
+  draw();
+};
+
+cv.addEventListener('mousemove',e=>{
+  const r=cv.getBoundingClientRect();
+  const sc=cv.width/r.width;
+  const mx2=(e.clientX-r.left)*sc;
+  const my2=(e.clientY-r.top)*sc;
+  const info=document.getElementById('info');
+  // 연결구 우선 검사
+  let ci=-1,cb=1e9;
+  cons.forEach((c,i)=>{
+    const dd=(mx2-c.cx)**2+(my2-c.cy)**2;
+    if(dd<=81&&dd<cb){cb=dd;ci=i;}
+  });
+  if(ci>=0){
+    const c=cons[ci];
+    info.textContent=`연결구: ${c.n} | 격자 좌표 (${c.gx}, ${c.gy})`;
+    return;
+  }
+  // 자리 검사
+  const hit=spots.find(s=>mx2>=s.px&&mx2<s.px+s.pw&&my2>=s.py&&my2<s.py+s.ph);
+  if(hit){
+    const t=tOf(hit), d=rawDist(hit);
+    const near=cons.reduce((b,c)=>Math.hypot(hit.cx-c.cx,hit.cy-c.cy)<Math.hypot(hit.cx-b.cx,hit.cy-b.cy)?c:b);
+    const cs=hit.cells.map(([x,y])=>`(${x},${y})`).join('+');
+    const kind=hit.dirH?'가로':'세로';
+    const mlabel=mode==='E'?'직선':mode==='W'?'보행':'절충';
+    info.textContent=
+      `${kind}자리 ${cs} | 등급 ${gL(t)} | ${mlabel} 거리 ${d.toFixed(1)} | 최근접: ${near.n}`;
+  } else info.textContent='';
+});
+cv.addEventListener('mouseleave',()=>document.getElementById('info').textContent='');
+
+draw();
+})();
+</script>
+</body>
+</html>
